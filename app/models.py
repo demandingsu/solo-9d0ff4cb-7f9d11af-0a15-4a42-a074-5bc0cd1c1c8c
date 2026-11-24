@@ -59,8 +59,10 @@ class Claim(Base):
     __table_args__ = (UniqueConstraint("workstation_id", "item_id", name="uq_claim_ws_item"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    workstation_id: Mapped[int] = mapped_column(ForeignKey("workstations.id", ondelete="CASCADE"))
-    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"))
+    workstation_id: Mapped[int] = mapped_column(
+        ForeignKey("workstations.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

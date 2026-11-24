@@ -147,7 +147,7 @@ def verify_batch(batch_id: int, session: Session = Depends(get_session)):
         if batch.status == "published":
             raise HTTPException(409, detail={"error": "batch_published", "message": "批次已发布"})
         ops = [op.payload for op in batch.ops]
-        state = services.load_state(session)
+        state = services.load_state_for_ops(session, ops)
         try:
             sim = services.simulate(state, ops)
         except services.OpError as exc:
@@ -188,7 +188,9 @@ def publish_batch(batch_id: int, session: Session = Depends(get_session)):
                 409,
                 detail={"error": "batch_not_verified", "message": "批次未核对通过,请先 verify"},
             )
-        state = services.load_state(session)
+        ops = [op.payload for op in batch.ops]
+        # 从同一份已生效状态重新按批次取数,再判断指纹与安全网
+        state = services.load_state_for_ops(session, ops)
         changed = services.fingerprint_changes(batch.fingerprint or {}, state)
         if changed:
             # 核对后所涉实体变过(即使改回原样):核对失效,打回 draft
@@ -204,7 +206,6 @@ def publish_batch(batch_id: int, session: Session = Depends(get_session)):
                     "changed_entities": changed,
                 },
             )
-        ops = [op.payload for op in batch.ops]
         try:
             sim = services.simulate(state, ops)
         except services.OpError as exc:

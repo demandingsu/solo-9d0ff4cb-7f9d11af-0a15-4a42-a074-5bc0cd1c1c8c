@@ -2,14 +2,22 @@
 
 并发模型:核对(verify)与发布(publish)在同一进程内由 STATE_LOCK 串行化,
 保证「核对指纹 -> 发布落库」之间不被其他核对/发布交错(单 uvicorn worker 部署)。
+
+取数模型:核对/发布只读取与批次**相关**的工位、项目和领用(见 load_state_for_ops),
+不再把全库载入内存。相关范围:
+
+1. 批次点名的工位与项目(模拟操作必须);
+2. 领用了批次所涉项目的工位(即使批次没点它的名),用于按批末领用关系检查旧终端公差;
+3. 上述相关工位领用的全部项目(补齐预览),但这些项目不再反向扩展工位范围,
+   也不进入核对指纹;共享项目只读取一次。
 """
 from __future__ import annotations
 
 import copy
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .models import Batch, Claim, Item, Workstation, utcnow
@@ -49,31 +57,101 @@ class WorkstationState:
 
 
 @dataclass
+class LoadStats:
+    """一次按批次取数实际读入的行数,用于确认取数范围不随无关数据增长。"""
+
+    queries: int = 0
+    item_rows: int = 0
+    workstation_rows: int = 0
+    claim_rows: int = 0
+
+    @property
+    def total_rows(self) -> int:
+        return self.item_rows + self.workstation_rows + self.claim_rows
+
+
+@dataclass
 class State:
     items: dict[str, ItemState]
     workstations: dict[str, WorkstationState]
     claims: set[tuple[str, str]]  # (workstation_code, item_code)
+    # 本次取数实际读入的行数(诊断用;不参与状态比较)
+    stats: LoadStats = field(default_factory=LoadStats, compare=False, repr=False)
 
 
-def load_state(session: Session) -> State:
-    items: dict[str, ItemState] = {}
-    item_code_by_id: dict[int, str] = {}
-    for it in session.scalars(select(Item)).all():
-        items[it.code] = ItemState(
-            it.code, it.name, it.nominal_um, it.upper_um, it.lower_um, it.version, it.claims_version
-        )
-        item_code_by_id[it.id] = it.code
+def load_state_for_ops(session: Session, ops: list[dict]) -> State:
+    """只读取批次相关的工位、项目和领用,不把全库载入内存。
+
+    相关范围分三步确定,后一步不会反向扩大前一步:
+
+    1. 批次点名的工位与项目(模拟操作所需);
+    2. 领用了所涉项目的工位——即使批次没点它的名,也要按批末领用关系
+       检查旧终端公差;
+    3. 上述相关工位领用的**全部项目**,用于列齐预览。这些只为补齐预览
+       而读入的项目不会再去查找领用它们的其他工位(不扩大工位范围),
+       也不进入核对指纹(不改变失效范围)。
+
+    工位、领用、项目各一条批量查询,每个项目/工位/领用最多读入一次。
+    """
+    item_codes, ws_codes = involved_entities(ops)
+    stats = LoadStats()
     workstations: dict[str, WorkstationState] = {}
     ws_code_by_id: dict[int, str] = {}
-    for ws in session.scalars(select(Workstation)).all():
-        workstations[ws.code] = WorkstationState(
-            ws.code, ws.name, ws.terminal_generation, ws.version, ws.claims_version
+
+    # 1+2) 批次点名的工位 ∪ 领用了所涉项目的工位(后者批次可能没点名);
+    #      用子查询在数据库侧去重,共用工位只读入一次。
+    ws_conditions = []
+    if ws_codes:
+        ws_conditions.append(Workstation.code.in_(ws_codes))
+    if item_codes:
+        claiming_ws_ids = (
+            select(Claim.workstation_id)
+            .join(Item, Item.id == Claim.item_id)
+            .where(Item.code.in_(item_codes))
         )
-        ws_code_by_id[ws.id] = ws.code
+        ws_conditions.append(Workstation.id.in_(claiming_ws_ids))
+    if ws_conditions:
+        stats.queries += 1
+        for ws in session.scalars(
+            select(Workstation).where(or_(*ws_conditions)).order_by(Workstation.code)
+        ).all():
+            workstations[ws.code] = WorkstationState(
+                ws.code, ws.name, ws.terminal_generation, ws.version, ws.claims_version
+            )
+            ws_code_by_id[ws.id] = ws.code
+            stats.workstation_rows += 1
+
+    # 3) 相关工位的全部领用关系(预览需要)
+    ws_ids = list(ws_code_by_id)
+    claim_rows: list[Claim] = []
+    claimed_item_ids: set[int] = set()
+    if ws_ids:
+        stats.queries += 1
+        claim_rows = list(session.scalars(select(Claim).where(Claim.workstation_id.in_(ws_ids))).all())
+        stats.claim_rows = len(claim_rows)
+        claimed_item_ids = {cl.item_id for cl in claim_rows}
+
+    # 4) 相关项目:所涉项目 ∪ 相关工位领用的项目;共用项目只读入一次
+    items: dict[str, ItemState] = {}
+    item_code_by_id: dict[int, str] = {}
+    if item_codes or claimed_item_ids:
+        conditions = []
+        if item_codes:
+            conditions.append(Item.code.in_(item_codes))
+        if claimed_item_ids:
+            conditions.append(Item.id.in_(claimed_item_ids))
+        stats.queries += 1
+        for it in session.scalars(select(Item).where(or_(*conditions))).all():
+            items[it.code] = ItemState(
+                it.code, it.name, it.nominal_um, it.upper_um, it.lower_um, it.version, it.claims_version
+            )
+            item_code_by_id[it.id] = it.code
+            stats.item_rows += 1
+
     claims: set[tuple[str, str]] = set()
-    for cl in session.scalars(select(Claim)).all():
+    for cl in claim_rows:
         claims.add((ws_code_by_id[cl.workstation_id], item_code_by_id[cl.item_id]))
-    return State(items, workstations, claims)
+    return State(items, workstations, claims, stats)
 
 
 # ---------------------------------------------------------------- 批次模拟
